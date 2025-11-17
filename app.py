@@ -1,120 +1,123 @@
-from flask import Flask, g, jsonify, request, send_from_directory, render_template
+from flask import Flask, jsonify, request, render_template
 from flask_cors import CORS
-import sqlite3
+from datetime import datetime, date
+from config import Config
+from models import db, Expense
+from flask_migrate import Migrate
 import os
-from config import DATABASE, DEBUG
 
-app = Flask(__name__, static_folder='static', template_folder='templates')
-app.config['JSON_SORT_KEYS'] = False
-app.config['DEBUG'] = DEBUG
-CORS(app)  # allow front-end to fetch from backend
+def create_app(config_class=Config):
+    app = Flask(__name__, static_folder='static', template_folder='templates')
+    app.config.from_object(config_class)
 
-# ---------- database helpers ----------
-def get_db():
-    db = getattr(g, '_database', None)
-    if db is None:
-        db = g._database = sqlite3.connect(DATABASE)
-        db.row_factory = sqlite_row_to_dict
-    return db
+    # initialize extensions
+    db.init_app(app)
+    migrate = Migrate(app, db)
+    CORS(app)
+    app.config['JSON_SORT_KEYS'] = False
 
-def sqlite_row_to_dict(cursor, row):
-    return {col[0]: row[idx] for idx, col in enumerate(cursor.description)}
+    @app.route('/')
+    def index():
+        # serve the frontend index (move your index.html to templates/)
+        return render_template('index.html')
 
-@app.teardown_appcontext
-def close_connection(exception):
-    db = getattr(g, '_database', None)
-    if db is not None:
-        db.close()
+    @app.route('/api/health', methods=['GET'])
+    def health():
+        return jsonify({"status": "ok"}), 200
 
-# ---------- helper utilities ----------
-def query_db(query, args=(), one=False):
-    cur = get_db().execute(query, args)
-    rv = cur.fetchall()
-    cur.close()
-    return (rv[0] if rv else None) if one else rv
+    @app.route('/api/expenses', methods=['GET'])
+    def get_expenses():
+        expenses = Expense.query.order_by(Expense.date.asc(), Expense.id.asc()).all()
+        return jsonify([e.to_dict() for e in expenses]), 200
 
-def execute_db(query, args=()):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(query, args)
-    conn.commit()
-    lastrowid = cur.lastrowid
-    cur.close()
-    return lastrowid
+    @app.route('/api/expenses', methods=['POST'])
+    def create_expense():
+        data = request.get_json(force=True, silent=True)
+        if not data:
+            return jsonify({"error": "Invalid JSON"}), 400
 
-# ---------- Routes ----------
-@app.route('/')
-def index():
-    # serve index.html from templates so url_for('static'...) works
-    return render_template('index.html')
+        description = (data.get('description') or '').strip()
+        amount = data.get('amount')
+        category = data.get('category') or 'Other'
+        date_str = data.get('date')
+        type_ = data.get('type') or 'expense'
 
-@app.route('/api/health', methods=['GET'])
-def health():
-    return jsonify({'status': 'ok'}), 200
+        # Validation
+        if not description or amount is None or not date_str:
+            return jsonify({"error": "Missing required fields (description, amount, date)"}), 400
 
-@app.route('/api/expenses', methods=['GET'])
-def get_expenses():
-    rows = query_db('SELECT * FROM expenses ORDER BY date ASC, id ASC')
-    return jsonify(rows), 200
+        try:
+            amount = float(amount)
+        except (ValueError, TypeError):
+            return jsonify({"error": "Invalid amount"}), 400
 
-@app.route('/api/expenses', methods=['POST'])
-def add_expense():
-    data = request.get_json(force=True, silent=True)
-    if not data:
-        return jsonify({'error': 'Invalid JSON'}), 400
+        # parse date (accept ISO format YYYY-MM-DD)
+        parsed_date = None
+        try:
+            # If client sent date portion only
+            parsed_date = date.fromisoformat(date_str)
+        except Exception:
+            # attempt datetime parse fallback
+            try:
+                parsed_date = datetime.fromisoformat(date_str).date()
+            except Exception:
+                return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
 
-    description = data.get('description', '').strip()
-    amount = data.get('amount')
-    category = data.get('category', 'Other')
-    date = data.get('date')
-    type_ = data.get('type', 'expense')
+        new_expense = Expense(
+            description=description,
+            amount=amount,
+            category=category,
+            date=parsed_date,
+            type=type_
+        )
+        db.session.add(new_expense)
+        db.session.commit()
+        return jsonify(new_expense.to_dict()), 201
 
-    # Basic validation
-    if not description or amount is None or date is None:
-        return jsonify({'error': 'Missing required fields'}), 400
+    @app.route('/api/expenses/<int:expense_id>', methods=['DELETE'])
+    def delete_expense(expense_id):
+        exp = Expense.query.get_or_404(expense_id)
+        db.session.delete(exp)
+        db.session.commit()
+        return jsonify({"deleted": expense_id}), 200
 
-    try:
-        amount = float(amount)
-    except ValueError:
-        return jsonify({'error': 'Invalid amount'}), 400
+    @app.route('/api/expenses', methods=['DELETE'])
+    def delete_all_expenses():
+        num = Expense.query.delete()
+        db.session.commit()
+        return jsonify({"deleted_all": True, "count": num}), 200
 
-    new_id = execute_db(
-        'INSERT INTO expenses (description, amount, category, date, type) VALUES (?, ?, ?, ?, ?)',
-        (description, amount, category, date, type_)
-    )
-    expense = query_db('SELECT * FROM expenses WHERE id = ?', (new_id,), one=True)
-    return jsonify(expense), 201
+    @app.route('/api/statistics', methods=['GET'])
+    def statistics():
+        # totals
+        income_total = db.session.query(db.func.coalesce(db.func.sum(Expense.amount), 0)).filter(Expense.type == 'income').scalar()
+        expense_total = db.session.query(db.func.coalesce(db.func.sum(Expense.amount), 0)).filter(Expense.type == 'expense').scalar()
+        balance = float(income_total) - float(expense_total)
 
-@app.route('/api/expenses/<int:expense_id>', methods=['DELETE'])
-def delete_expense(expense_id):
-    execute_db('DELETE FROM expenses WHERE id = ?', (expense_id,))
-    return jsonify({'deleted': expense_id}), 200
+        # breakdown by category for expenses
+        rows = (
+            db.session.query(Expense.category, db.func.coalesce(db.func.sum(Expense.amount), 0).label('total'))
+            .filter(Expense.type == 'expense')
+            .group_by(Expense.category)
+            .all()
+        )
+        by_category = [{"category": r[0], "total": float(r[1])} for r in rows]
 
-@app.route('/api/expenses', methods=['DELETE'])
-def delete_all_expenses():
-    execute_db('DELETE FROM expenses')
-    return jsonify({'deleted_all': True}), 200
+        return jsonify({
+            "income": float(income_total),
+            "expenses": float(expense_total),
+            "balance": balance,
+            "by_category": by_category
+        }), 200
 
-@app.route('/api/statistics', methods=['GET'])
-def get_statistics():
-    # total income, total expense, balance, breakdown by category
-    income_row = query_db("SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE type='income'", one=True)
-    expense_row = query_db("SELECT COALESCE(SUM(amount), 0) AS total FROM expenses WHERE type='expense'", one=True)
-    balance = float(income_row['total']) - float(expense_row['total'])
-
-    # category breakdown for expenses
-    rows = query_db("SELECT category, COALESCE(SUM(amount), 0) AS total FROM expenses WHERE type='expense' GROUP BY category")
-    return jsonify({
-        'income': float(income_row['total']),
-        'expenses': float(expense_row['total']),
-        'balance': balance,
-        'by_category': rows
-    }), 200
-
-# Static files are served automatically by Flask from /static, so no extra route needed.
+    return app
 
 if __name__ == '__main__':
-    # create DB file if missing
-    if not os.path.exists(DATABASE):
-        print('Database not found — run "python init_db.py" to initialize with schema/sample data.')
-    app.run(host='0.0.0.0', port=5000, debug=app.config['DEBUG'])
+    # development run
+    app = create_app()
+    # create DB if not exists (migrations preferred)
+    with app.app_context():
+        # create tables if they don't exist (safe for quick start)
+        db.create_all()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=app.config.get('DEBUG', True))
