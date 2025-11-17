@@ -10,7 +10,6 @@ def create_app(config_class=Config):
     app = Flask(__name__, static_folder='static', template_folder='templates')
     app.config.from_object(config_class)
 
-    # initialize extensions
     db.init_app(app)
     migrate = Migrate(app, db)
     CORS(app)
@@ -18,12 +17,25 @@ def create_app(config_class=Config):
 
     @app.route('/')
     def index():
-        # serve the frontend index (move your index.html to templates/)
         return render_template('index.html')
 
-    @app.route('/api/health', methods=['GET'])
+    @app.route('/api/health')
     def health():
         return jsonify({"status": "ok"}), 200
+
+    # -----------------
+    # Accept both date formats
+    # -----------------
+    def parse_date(date_str):
+        try:
+            # Check DD/MM/YYYY
+            if "/" in date_str:
+                d, m, y = date_str.split("/")
+                return date(int(y), int(m), int(d))
+            # ISO format YYYY-MM-DD
+            return date.fromisoformat(date_str)
+        except:
+            raise ValueError("Invalid date format. Use DD/MM/YYYY or YYYY-MM-DD")
 
     @app.route('/api/expenses', methods=['GET'])
     def get_expenses():
@@ -32,47 +44,40 @@ def create_app(config_class=Config):
 
     @app.route('/api/expenses', methods=['POST'])
     def create_expense():
-        data = request.get_json(force=True, silent=True)
+        data = request.get_json()
+
         if not data:
             return jsonify({"error": "Invalid JSON"}), 400
 
-        description = (data.get('description') or '').strip()
-        amount = data.get('amount')
-        category = data.get('category') or 'Other'
-        date_str = data.get('date')
-        type_ = data.get('type') or 'expense'
-
-        # Validation
-        if not description or amount is None or not date_str:
-            return jsonify({"error": "Missing required fields (description, amount, date)"}), 400
-
         try:
-            amount = float(amount)
-        except (ValueError, TypeError):
-            return jsonify({"error": "Invalid amount"}), 400
+            description = data.get("description")
+            amount = float(data.get("amount"))
+            category = data.get("category")
+            date_str = data.get("date")
+            type_ = data.get("type")
 
-        # parse date (accept ISO format YYYY-MM-DD)
-        parsed_date = None
-        try:
-            # If client sent date portion only
-            parsed_date = date.fromisoformat(date_str)
-        except Exception:
-            # attempt datetime parse fallback
-            try:
-                parsed_date = datetime.fromisoformat(date_str).date()
-            except Exception:
-                return jsonify({"error": "Invalid date format. Use YYYY-MM-DD"}), 400
+            if not description or not amount or not date_str or not type_:
+                return jsonify({"error": "Missing fields"}), 400
 
-        new_expense = Expense(
-            description=description,
-            amount=amount,
-            category=category,
-            date=parsed_date,
-            type=type_
-        )
-        db.session.add(new_expense)
-        db.session.commit()
-        return jsonify(new_expense.to_dict()), 201
+            parsed_date = parse_date(date_str)
+
+            new_expense = Expense(
+                description=description,
+                amount=amount,
+                category=category or "Other",
+                date=parsed_date,
+                type=type_
+            )
+            db.session.add(new_expense)
+            db.session.commit()
+
+            return jsonify(new_expense.to_dict()), 201
+
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 400
+
+        except Exception as e:
+            return jsonify({"error": "Server error", "details": str(e)}), 500
 
     @app.route('/api/expenses/<int:expense_id>', methods=['DELETE'])
     def delete_expense(expense_id):
@@ -83,41 +88,35 @@ def create_app(config_class=Config):
 
     @app.route('/api/expenses', methods=['DELETE'])
     def delete_all_expenses():
-        num = Expense.query.delete()
+        db.session.query(Expense).delete()
         db.session.commit()
-        return jsonify({"deleted_all": True, "count": num}), 200
+        return jsonify({"deleted_all": True}), 200
 
-    @app.route('/api/statistics', methods=['GET'])
+    @app.route('/api/statistics')
     def statistics():
-        # totals
-        income_total = db.session.query(db.func.coalesce(db.func.sum(Expense.amount), 0)).filter(Expense.type == 'income').scalar()
-        expense_total = db.session.query(db.func.coalesce(db.func.sum(Expense.amount), 0)).filter(Expense.type == 'expense').scalar()
-        balance = float(income_total) - float(expense_total)
+        income = db.session.query(db.func.sum(Expense.amount)).filter(Expense.type == 'income').scalar() or 0
+        expense = db.session.query(db.func.sum(Expense.amount)).filter(Expense.type == 'expense').scalar() or 0
 
-        # breakdown by category for expenses
         rows = (
-            db.session.query(Expense.category, db.func.coalesce(db.func.sum(Expense.amount), 0).label('total'))
-            .filter(Expense.type == 'expense')
+            db.session.query(Expense.category, db.func.sum(Expense.amount))
+            .filter(Expense.type == "expense")
             .group_by(Expense.category)
             .all()
         )
-        by_category = [{"category": r[0], "total": float(r[1])} for r in rows]
 
         return jsonify({
-            "income": float(income_total),
-            "expenses": float(expense_total),
-            "balance": balance,
-            "by_category": by_category
+            "income": float(income),
+            "expenses": float(expense),
+            "balance": float(income - expense),
+            "by_category": [{"category": cat, "total": float(val)} for cat, val in rows]
         }), 200
 
     return app
 
-if __name__ == '__main__':
-    # development run
+
+if __name__ == "__main__":
     app = create_app()
-    # create DB if not exists (migrations preferred)
     with app.app_context():
-        # create tables if they don't exist (safe for quick start)
         db.create_all()
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=app.config.get('DEBUG', True))
+
+    app.run(host="0.0.0.0", port=5000, debug=True)

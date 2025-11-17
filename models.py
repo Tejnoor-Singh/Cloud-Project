@@ -11,7 +11,7 @@ class Expense(db.Model):
     amount = db.Column(db.Float, nullable=False)
     category = db.Column(db.String(100), nullable=False, default="Other")
     date = db.Column(db.Date, nullable=False)
-    type = db.Column(db.String(10), nullable=False)  # 'income' or 'expense'
+    type = db.Column(db.String(10), nullable=False)
 
     def to_dict(self):
         return {
@@ -19,6 +19,6 @@ class Expense(db.Model):
             "description": self.description,
             "amount": float(self.amount),
             "category": self.category,
-            "date": self.date.isoformat() if isinstance(self.date, date) else str(self.date),
+            "date": self.date.isoformat(),
             "type": self.type
         }
